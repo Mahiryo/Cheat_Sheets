@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import sys
+import random
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -26,25 +27,40 @@ except ImportError:
 log = logging.getLogger("explorer")
 
 ARQUIVO_ENV = ".env"
+
+# --- paginas-pai onde a busca comeca
+# Ordem de prioridade: argumentos na linha de comando > --arquivo-raizes > raizes.txt (se existir) > RAIZES_PADRAO.
+# No arquivo: uma por linha (URL, caminho /spaces/X/pages/ID ou so o ID); linhas com # sao comentarios.
+ARQUIVO_RAIZES = "raizes.txt"
 RAIZES_PADRAO = [
     "/spaces/CCENTER/pages/750395627/2026",
     "/spaces/CCENTER/pages/561739216/2025",
 ]
+
 MONGO_DB_PADRAO = "local"
 MONGO_COLLECTION_PADRAO = "paginas"
-TAMANHO_LOTE_MONGO = 500
+TAMANHO_LOTE_MONGO = 100
 
-# --- ritmo e limites de requisicao
-LIMITE_POR_REQUISICAO = 100     # itens por chamada (menos chamadas = menos consumo do limite)
-INTERVALO_MINIMO = 1.0          # segundos entre requisicoes (padrao de --pausa)
-MAX_TENTATIVAS = 6              # tentativas por requisicao
+# --- ritmo (lento de proposito)
+LIMITE_POR_REQUISICAO = 25      # itens por chamada (respostas pequenas e leves)
+INTERVALO_MINIMO = 5.0          # segundos entre requisicoes (padrao de --pausa)
+VARIACAO_PAUSA = 0.3            # ate +30% aleatorio em cada pausa, para nao bater em rajada regular
+PAUSA_ENTRE_RAIZES = 30.0       # segundos de descanso antes de cada nova pagina-pai
+FATOR_APOS_429 = 2.0            # cada 429 multiplica o intervalo por este fator...
+MAX_INTERVALO = 60.0            # ...ate este teto
+MAX_TENTATIVAS = 4              # tentativas por requisicao
+MAX_BACKOFF = 120               # espera maxima entre tentativas
 MAX_RETRY_AFTER = 300           # se o servidor pedir mais que isso, aborta
 TIMEOUT = (10, 60)              # conexao, leitura
 
+# --- tamanho da busca (pequena por padrao; 0 na linha de comando = sem limite)
+MAX_PAGINAS_PADRAO = 200        # paginas coletadas por execucao
+MAX_REQUISICOES_PADRAO = 150    # requisicoes HTTP por execucao (~15 min no ritmo padrao)
+MAX_PROFUNDIDADE = 5            # niveis abaixo de cada pagina-pai
+
 # --- protecoes contra loop e falha em cascata
 FALHAS_SEGUIDAS = 3             # disjuntor: ramos seguidos sem resposta valida
-MAX_PAGINAS_POR_LISTAGEM = 500  # paginas de resultado por listagem de filhas (500 x 100 = 50 mil filhas)
-MAX_PROFUNDIDADE = 50           # niveis abaixo da raiz
+MAX_PAGINAS_POR_LISTAGEM = 20   # paginas de resultado por listagem (20 x 25 = 500 filhas por pagina)
 
 
 # --------------------------------------------------------------------------- erros
@@ -94,6 +110,37 @@ def parse_raiz(texto: str) -> Raiz:
     if m:
         return Raiz(m.group(1), None)
     raise ValueError(f"Nao reconheci a pagina-raiz: {texto!r}")
+
+
+def ler_arquivo_raizes(caminho: str) -> list[str]:
+    linhas = []
+    for bruta in Path(caminho).read_text(encoding="utf-8-sig").splitlines():
+        texto = bruta.split(" #", 1)[0].strip()
+        if texto and not texto.startswith("#"):
+            linhas.append(texto)
+    return linhas
+
+
+def escolher_raizes(argumentos: list[str], arquivo: str | None) -> tuple[list[Raiz], str]:
+    """Devolve as raizes (sem repeticao, na ordem dada) e de onde vieram."""
+    if argumentos:
+        textos, origem = argumentos, "linha de comando"
+    elif arquivo:
+        textos, origem = ler_arquivo_raizes(arquivo), arquivo
+    elif Path(ARQUIVO_RAIZES).is_file():
+        textos, origem = ler_arquivo_raizes(ARQUIVO_RAIZES), ARQUIVO_RAIZES
+    else:
+        textos, origem = RAIZES_PADRAO, "RAIZES_PADRAO"
+
+    raizes, vistas = [], set()
+    for texto in textos:
+        raiz = parse_raiz(texto)
+        if raiz.page_id not in vistas:
+            vistas.add(raiz.page_id)
+            raizes.append(raiz)
+    if not raizes:
+        raise ValueError(f"Nenhuma pagina-pai informada em {origem}")
+    return raizes, origem
 
 
 # --------------------------------------------------------------------------- autenticacao (igual ao crawler)
@@ -174,6 +221,17 @@ def restantes_servidor(headers) -> int | None:
         return None
 
 
+def bloqueado_servidor(headers) -> bool:
+    """Rate limiting em "Block all requests" (ou cota zero): esperar nao adianta."""
+    for nome in ("X-RateLimit-Limit", "X-RateLimit-FillRate"):
+        try:
+            if float(headers[nome]) <= 0:
+                return True
+        except (KeyError, ValueError):
+            continue
+    return False
+
+
 def cabecalhos_limite(headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower().startswith(("retry-after", "x-ratelimit"))}
 
@@ -213,7 +271,18 @@ class ConfluenceClient:
             time.sleep(min(restante, 0.5))
 
     def _agendar(self, segundos: float = 0.0):
-        self._proxima = time.monotonic() + max(self.intervalo, segundos)
+        pausa = self.intervalo * (1 + random.uniform(0, VARIACAO_PAUSA))
+        self._proxima = time.monotonic() + max(pausa, segundos)
+
+    def descansar(self, segundos: float):
+        """Garante uma pausa extra antes da proxima requisicao (ex.: entre paginas-pai)."""
+        self._proxima = max(self._proxima, time.monotonic() + segundos)
+
+    def _desacelerar(self, ritmo: float | None):
+        novo = min(max(self.intervalo * FATOR_APOS_429, ritmo or 0.0), MAX_INTERVALO)
+        if novo > self.intervalo:
+            log.warning("Reduzindo o ritmo para 1 requisicao a cada %.1fs", novo)
+            self.intervalo = novo
 
     def _ajustar_ritmo(self, headers, apos_429: bool = False) -> float:
         """Devolve quanto esperar antes da proxima chamada, segundo os cabecalhos do servidor."""
@@ -221,12 +290,11 @@ class ConfluenceClient:
             self._limite_informado = True
             log.info("Limite do Confluence: %s", cabecalhos_limite(headers))
         ritmo = ritmo_servidor(headers)
+        if apos_429:
+            # A cota esvaziou: daqui em diante anda mais devagar, nunca abaixo do ritmo de reposicao.
+            self._desacelerar(ritmo)
         if ritmo is None:
             return 0.0
-        if apos_429 and ritmo > self.intervalo:
-            # O balde de tokens esvaziou: daqui em diante, anda no ritmo em que o servidor repoe.
-            log.warning("Reduzindo o ritmo para 1 requisicao a cada %.1fs (limite do servidor)", ritmo)
-            self.intervalo = ritmo
         restantes = restantes_servidor(headers)
         if restantes is not None and restantes <= 2:
             return ritmo
@@ -243,7 +311,7 @@ class ConfluenceClient:
             if self.max_requisicoes and self.requisicoes >= self.max_requisicoes:
                 raise OrcamentoEsgotado(f"limite de {self.max_requisicoes} requisicoes atingido")
             self._dormir(self._proxima - time.monotonic())
-            backoff = min(max(self.intervalo, 1.0) * 2 ** (tentativa - 1), 60)
+            backoff = min(max(self.intervalo, 1.0) * 2 ** tentativa, MAX_BACKOFF)
 
             try:
                 resp = self.sessao.get(url, params=params, timeout=TIMEOUT,
@@ -264,6 +332,14 @@ class ConfluenceClient:
             with resp:
                 if resp.status_code == 429:
                     self.respostas_429 += 1
+                    limites = cabecalhos_limite(resp.headers)
+                    if self.respostas_429 == 1:
+                        log.warning("Primeiro HTTP 429. Cabecalhos de limite: %s",
+                                    limites or "nenhum (o 429 pode vir de um proxy/WAF, nao do Confluence)")
+                    if bloqueado_servidor(resp.headers):
+                        raise LimiteExcedido(
+                            "o seu usuario esta sem cota na API REST (rate limiting em 'Block all requests' "
+                            "ou cota zero)")
                     espera = segundos_retry_after(resp)
                     self._ajustar_ritmo(resp.headers, apos_429=True)
                     log.debug("Cabecalhos do 429: %s", cabecalhos_limite(resp.headers))
@@ -538,8 +614,8 @@ class Disjuntor:
 
 
 def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Raiz], *,
-             max_paginas: int | None = None, max_profundidade: int = MAX_PROFUNDIDADE,
-             parar=lambda: False) -> Resumo:
+             max_paginas: int | None = None, max_profundidade: int | None = MAX_PROFUNDIDADE,
+             pausa_entre_raizes: float = PAUSA_ENTRE_RAIZES, parar=lambda: False) -> Resumo:
     resumo = Resumo()
     visitadas: set[str] = set()
     disjuntor = Disjuntor(FALHAS_SEGUIDAS)
@@ -549,9 +625,16 @@ def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Rai
                               "Confira a VPN, a URL e se o servidor esta no ar.")
 
     try:
-        for raiz in raizes:
+        for indice, raiz in enumerate(raizes):
             if parar() or resumo.limite_atingido or resumo.abortado:
                 break
+            if raiz.page_id in visitadas:
+                log.info("Pagina-pai %s ja foi coberta por outra pagina-pai; pulando", raiz.page_id)
+                resumo.raizes.append((raiz.page_id, "(ja coberta)", 0))
+                continue
+            if indice and pausa_entre_raizes:
+                log.info("Pausa de %.0fs antes da proxima pagina-pai", pausa_entre_raizes)
+                cliente.descansar(pausa_entre_raizes)
             try:
                 dados_raiz, base = validar_raiz(cliente, raiz)
                 disjuntor.sucesso()
@@ -572,6 +655,15 @@ def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Rai
                      (dados_raiz.get("space") or {}).get("key"))
             visitadas.add(raiz.page_id)
             antes = resumo.encontradas
+
+            # A propria pagina-pai tambem vai para o Mongo (ja veio na validacao, sem custo extra).
+            doc_raiz, motivo = extrair_metadados(dados_raiz, base)
+            if doc_raiz:
+                doc_raiz.update(pai_id=None, raiz_id=raiz.page_id, raiz_titulo=titulo_raiz, profundidade=0)
+                repo.adicionar(doc_raiz)
+                resumo.encontradas += 1
+            else:
+                log.warning("Pagina-pai %s nao gravada: %s", raiz.page_id, motivo)
 
             fila = deque([(raiz.page_id, 0)])
             while fila and not resumo.abortado:
@@ -596,7 +688,7 @@ def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Rai
                             continue
                         visitadas.add(doc["page_id"])
 
-                        if nivel + 1 < max_profundidade:
+                        if not max_profundidade or nivel + 1 < max_profundidade:
                             fila.append((doc["page_id"], nivel + 1))
                         else:
                             resumo.profundidade_excedida += 1
@@ -632,8 +724,10 @@ def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Rai
     except OrcamentoEsgotado as e:
         resumo.limite_atingido = str(e)
     except LimiteExcedido as e:
-        resumo.abortado = (5, f"Limite de requisicoes do Confluence: {e}. Espere alguns minutos, "
-                              "confira se outro processo usa o mesmo PAT e rode de novo com --pausa maior.")
+        resumo.abortado = (5, f"Limite da API REST do Confluence: {e}. O crawler nao e afetado porque usa "
+                              "a exportacao da interface web, fora do rate limiting. Peca ao administrador "
+                              "uma excecao para o seu usuario em Administracao > Configuracao geral > "
+                              "Rate limiting. Rode com --diagnostico para ver o que o servidor responde.")
     except ErroAutenticacao as e:
         resumo.abortado = (4, f"{e}. Gere um novo PAT, atualize o {ARQUIVO_ENV} e rode de novo.")
     except requests.exceptions.SSLError as e:
@@ -691,20 +785,67 @@ def imprimir_resumo(resumo: Resumo, cliente: ConfluenceClient, repo: Repositorio
     print(linha)
 
 
+def diagnosticar(base_url: str, pat: str, ca_bundle: str, page_id: str) -> int:
+    """Uma unica requisicao REST, sem novas tentativas, mostrando tudo o que o servidor devolveu."""
+    sessao = criar_sessao(pat, ca_bundle)
+    url = f"{base_url}/rest/api/content/{page_id}"
+    print(f"GET {url}")
+    try:
+        resp = sessao.get(url, params={"expand": "version,space"}, timeout=TIMEOUT,
+                          allow_redirects=False, verify=sessao.verify)
+    except requests.exceptions.SSLError as e:
+        print("Erro TLS:", explicar_erro_tls(e))
+        return 4
+    except requests.RequestException as e:
+        print("Sem resposta:", e)
+        return 6
+    with resp:
+        print(f"HTTP {resp.status_code}")
+        for k, v in resp.headers.items():
+            if k.lower().startswith(("retry-after", "x-ratelimit", "content-type", "location",
+                                     "server", "via", "x-asen", "x-seraph", "x-ausername")):
+                print(f"  {k}: {v}")
+        corpo = resp.text[:500].strip()
+        if corpo:
+            print("Corpo (inicio):", corpo)
+        limites = cabecalhos_limite(resp.headers)
+        print()
+        if resp.status_code == 200:
+            print("A API REST respondeu normalmente. Se o 429 aparece depois, e a cota acabando: aumente --pausa.")
+        elif resp.status_code == 429 and bloqueado_servidor(resp.headers):
+            print("O seu usuario esta bloqueado na API REST (cota zero). So o administrador resolve.")
+        elif resp.status_code == 429 and limites:
+            print("O Confluence limitou o seu usuario. Veja Retry-After e X-RateLimit-* acima.")
+        elif resp.status_code == 429:
+            print("O 429 veio sem cabecalhos X-RateLimit: provavelmente um proxy/WAF na frente do Confluence "
+                  "bloqueando /rest/. Fale com a equipe de infraestrutura.")
+        elif resp.status_code == 401 or eh_login(resp.headers.get("Location")):
+            print("O PAT foi recusado.")
+    return 0 if resp.status_code == 200 else 1
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="Coleta metadados das paginas descendentes de paginas-raiz do Confluence.")
-    p.add_argument("raizes", nargs="*", default=RAIZES_PADRAO,
-                   help="caminho (/spaces/X/pages/ID/...), URL ou ID das paginas-raiz "
-                        "(padrao: CCENTER 2026 e 2025)")
-    p.add_argument("--max-paginas", type=int, help="para apos N paginas coletadas")
-    p.add_argument("--max-requisicoes", type=int, help="para apos N requisicoes HTTP")
+    p.add_argument("raizes", nargs="*",
+                   help="paginas-pai onde a busca comeca: URL, caminho /spaces/X/pages/ID ou ID. "
+                        f"Sem argumentos, le {ARQUIVO_RAIZES} (se existir) ou usa RAIZES_PADRAO")
+    p.add_argument("-a", "--arquivo-raizes",
+                   help="arquivo com uma pagina-pai por linha (# para comentarios)")
+    p.add_argument("--max-paginas", type=int, default=MAX_PAGINAS_PADRAO,
+                   help=f"para apos N paginas coletadas (padrao {MAX_PAGINAS_PADRAO}; 0 = sem limite)")
+    p.add_argument("--max-requisicoes", type=int, default=MAX_REQUISICOES_PADRAO,
+                   help=f"para apos N requisicoes HTTP (padrao {MAX_REQUISICOES_PADRAO}; 0 = sem limite)")
     p.add_argument("--max-profundidade", type=int, default=MAX_PROFUNDIDADE,
-                   help=f"niveis abaixo da raiz a explorar (padrao {MAX_PROFUNDIDADE})")
+                   help=f"niveis abaixo de cada pagina-pai (padrao {MAX_PROFUNDIDADE}; 0 = sem limite)")
     p.add_argument("--pausa", type=float, default=INTERVALO_MINIMO,
                    help=f"segundos minimos entre requisicoes (padrao {INTERVALO_MINIMO}); "
-                        "sobe sozinho se o Confluence pedir")
+                        "aumenta sozinho a cada HTTP 429")
+    p.add_argument("--pausa-raiz", type=float, default=PAUSA_ENTRE_RAIZES,
+                   help=f"segundos de descanso antes de cada nova pagina-pai (padrao {PAUSA_ENTRE_RAIZES:.0f})")
     p.add_argument("--dry-run", action="store_true", help="nao grava no Mongo")
+    p.add_argument("--diagnostico", action="store_true",
+                   help="faz uma unica requisicao a primeira pagina-pai e mostra a resposta do servidor")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -712,13 +853,28 @@ def main(argv=None) -> int:
                         format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+    for nome in ("max_paginas", "max_requisicoes", "max_profundidade", "pausa", "pausa_raiz"):
+        if getattr(args, nome) < 0:
+            p.error(f"--{nome.replace('_', '-')} nao pode ser negativo")
+
     try:
-        raizes = [parse_raiz(r) for r in args.raizes]
+        raizes, origem = escolher_raizes(args.raizes, args.arquivo_raizes)
+    except FileNotFoundError as e:
+        log.error("Arquivo de paginas-pai nao encontrado: %s", e.filename)
+        return 2
     except ValueError as e:
         log.error(str(e))
         return 2
 
+    log.info("%d pagina(s)-pai (de %s): %s", len(raizes), origem,
+             ", ".join(r.page_id for r in raizes))
+    log.info("Limites: %s paginas, %s requisicoes, profundidade %s, pausa %.1fs, pausa entre pais %.0fs",
+             args.max_paginas or "sem limite", args.max_requisicoes or "sem limite",
+             args.max_profundidade or "sem limite", args.pausa, args.pausa_raiz)
+
     base_url, pat, ca_bundle, env = ler_env()
+    if args.diagnostico:
+        return diagnosticar(base_url, pat, ca_bundle, raizes[0].page_id)
 
     interromper = {"sim": False}
 
@@ -729,7 +885,7 @@ def main(argv=None) -> int:
         log.warning("Interrompendo (Ctrl+C de novo para forcar)...")
 
     cliente = ConfluenceClient(base_url, pat, ca_bundle, intervalo=args.pausa,
-                               max_requisicoes=args.max_requisicoes,
+                               max_requisicoes=args.max_requisicoes or None,
                                parar=lambda: interromper["sim"])
 
     colecao = None
@@ -748,8 +904,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, ao_ctrl_c)
 
     try:
-        resumo = explorar(cliente, repo, raizes, max_paginas=args.max_paginas,
-                          max_profundidade=args.max_profundidade,
+        resumo = explorar(cliente, repo, raizes, max_paginas=args.max_paginas or None,
+                          max_profundidade=args.max_profundidade or None,
+                          pausa_entre_raizes=args.pausa_raiz,
                           parar=lambda: interromper["sim"])
     except KeyboardInterrupt:
         log.error("Interrompido a forca.")
