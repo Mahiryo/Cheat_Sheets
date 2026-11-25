@@ -10,6 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -31,21 +32,49 @@ RAIZES_PADRAO = [
 ]
 MONGO_DB_PADRAO = "local"
 MONGO_COLLECTION_PADRAO = "paginas"
-LIMITE_POR_REQUISICAO = 100
 TAMANHO_LOTE_MONGO = 500
-MAX_TENTATIVAS = 6
 
+# --- ritmo e limites de requisicao
+LIMITE_POR_REQUISICAO = 100     # itens por chamada (menos chamadas = menos consumo do limite)
+INTERVALO_MINIMO = 1.0          # segundos entre requisicoes (padrao de --pausa)
+MAX_TENTATIVAS = 6              # tentativas por requisicao
+MAX_RETRY_AFTER = 300           # se o servidor pedir mais que isso, aborta
+TIMEOUT = (10, 60)              # conexao, leitura
+
+# --- protecoes contra loop e falha em cascata
+FALHAS_SEGUIDAS = 3             # disjuntor: ramos seguidos sem resposta valida
+MAX_PAGINAS_POR_LISTAGEM = 500  # paginas de resultado por listagem de filhas (500 x 100 = 50 mil filhas)
+MAX_PROFUNDIDADE = 50           # niveis abaixo da raiz
+
+
+# --------------------------------------------------------------------------- erros
 
 class NaoEhConfluence(Exception):
     pass
 
 
 class ErroAutenticacao(Exception):
-    """PAT recusado (HTTP 401 ou redirecionamento para a tela de login). Interrompe a execucao."""
+    """PAT recusado (HTTP 401 ou tela de login). Aborta a execucao."""
 
 
 class SemPermissao(Exception):
-    """HTTP 403: o PAT e valido, mas nao pode ler aquela pagina. So o ramo e ignorado."""
+    """HTTP 403: o PAT e valido, mas nao le aquela pagina. So o ramo e ignorado."""
+
+
+class LimiteExcedido(Exception):
+    """HTTP 429 persistente ou espera longa demais. Aborta: as proximas chamadas tambem falhariam."""
+
+
+class FalhaServidor(Exception):
+    """Sem resposta valida apos todas as tentativas (rede/5xx). Conta para o disjuntor."""
+
+
+class Interrompido(Exception):
+    """Ctrl+C durante uma espera."""
+
+
+class OrcamentoEsgotado(Exception):
+    """--max-requisicoes atingido."""
 
 
 @dataclass
@@ -67,7 +96,7 @@ def parse_raiz(texto: str) -> Raiz:
     raise ValueError(f"Nao reconheci a pagina-raiz: {texto!r}")
 
 
-# --------------------------------------------------------------------------- autenticacao
+# --------------------------------------------------------------------------- autenticacao (igual ao crawler)
 
 def ler_env():
     valores = {**dotenv_values(ARQUIVO_ENV, interpolate=False), **os.environ}
@@ -86,8 +115,6 @@ def ler_env():
 def criar_sessao(pat: str, ca_bundle: str) -> requests.Session:
     truststore.inject_into_ssl()
     sessao = requests.Session()
-    # Ignora proxies/CA de variaveis de ambiente: a confianca vem do sistema (truststore)
-    # ou do CONFLUENCE_CA_BUNDLE.
     sessao.trust_env = False
     sessao.headers.update({
         "Authorization": f"Bearer {pat}",
@@ -113,94 +140,232 @@ def eh_login(url: str | None) -> bool:
         ("/login.action", "/dologin.action", "/login.jsp"))
 
 
+# --------------------------------------------------------------------------- limites do servidor
+
+def segundos_retry_after(resp: requests.Response) -> float | None:
+    """Retry-After em segundos ou data HTTP; sem ele, usa o ritmo de reposicao do token bucket."""
+    valor = resp.headers.get("Retry-After", "").strip()
+    if valor:
+        try:
+            return max(0.0, float(valor))
+        except ValueError:
+            pass
+        try:
+            return max(0.0, parsedate_to_datetime(valor).timestamp() - time.time())
+        except (TypeError, ValueError):
+            pass
+    return ritmo_servidor(resp.headers)
+
+
+def ritmo_servidor(headers) -> float | None:
+    """Segundos para o Confluence repor 1 requisicao (X-RateLimit-Interval-Seconds / X-RateLimit-FillRate)."""
+    try:
+        intervalo = float(headers["X-RateLimit-Interval-Seconds"])
+        reposicao = float(headers["X-RateLimit-FillRate"])
+    except (KeyError, ValueError):
+        return None
+    return intervalo / reposicao if intervalo > 0 and reposicao > 0 else None
+
+
+def restantes_servidor(headers) -> int | None:
+    try:
+        return int(headers["X-RateLimit-Remaining"])
+    except (KeyError, ValueError):
+        return None
+
+
+def cabecalhos_limite(headers) -> dict:
+    return {k: v for k, v in headers.items() if k.lower().startswith(("retry-after", "x-ratelimit"))}
+
+
 # --------------------------------------------------------------------------- cliente
 
 class ConfluenceClient:
-    def __init__(self, base_url: str, pat: str, ca_bundle: str = "",
-                 pausa: float = 0.0, timeout: float = 30.0):
+    def __init__(self, base_url: str, pat: str, ca_bundle: str = "", *,
+                 intervalo: float = INTERVALO_MINIMO, max_requisicoes: int | None = None,
+                 parar=lambda: False):
         self.base = base_url.rstrip("/")
         self.api = self.base + "/rest/api"
         self.host = urlparse(self.base).netloc.lower()
-        self.pausa = pausa
-        self.timeout = timeout
-        self.requisicoes = 0
         self.sessao = criar_sessao(pat, ca_bundle)
+        self.parar = parar
+        self.max_requisicoes = max_requisicoes
+
+        self.intervalo = max(0.0, intervalo)  # ritmo atual; sobe se o servidor pedir
+        self._proxima = 0.0
+        self._limite_informado = False
+
+        self.requisicoes = 0
+        self.respostas_429 = 0
+        self.listagens_truncadas = 0
+
+    # ---- ritmo
+
+    def _dormir(self, segundos: float):
+        """Espera em fatias curtas para o Ctrl+C funcionar mesmo durante esperas longas."""
+        fim = time.monotonic() + max(0.0, segundos)
+        while True:
+            if self.parar():
+                raise Interrompido()
+            restante = fim - time.monotonic()
+            if restante <= 0:
+                return
+            time.sleep(min(restante, 0.5))
+
+    def _agendar(self, segundos: float = 0.0):
+        self._proxima = time.monotonic() + max(self.intervalo, segundos)
+
+    def _ajustar_ritmo(self, headers, apos_429: bool = False) -> float:
+        """Devolve quanto esperar antes da proxima chamada, segundo os cabecalhos do servidor."""
+        if not self._limite_informado and cabecalhos_limite(headers):
+            self._limite_informado = True
+            log.info("Limite do Confluence: %s", cabecalhos_limite(headers))
+        ritmo = ritmo_servidor(headers)
+        if ritmo is None:
+            return 0.0
+        if apos_429 and ritmo > self.intervalo:
+            # O balde de tokens esvaziou: daqui em diante, anda no ritmo em que o servidor repoe.
+            log.warning("Reduzindo o ritmo para 1 requisicao a cada %.1fs (limite do servidor)", ritmo)
+            self.intervalo = ritmo
+        restantes = restantes_servidor(headers)
+        if restantes is not None and restantes <= 2:
+            return ritmo
+        return 0.0
+
+    # ---- requisicao
 
     def _get(self, url: str, params: dict | None = None) -> dict:
         if urlparse(url).netloc.lower() != self.host:
             raise NaoEhConfluence(f"URL fora do host configurado: {url}")
 
+        problema = ""
         for tentativa in range(1, MAX_TENTATIVAS + 1):
-            if self.pausa:
-                time.sleep(self.pausa)
+            if self.max_requisicoes and self.requisicoes >= self.max_requisicoes:
+                raise OrcamentoEsgotado(f"limite de {self.max_requisicoes} requisicoes atingido")
+            self._dormir(self._proxima - time.monotonic())
+            backoff = min(max(self.intervalo, 1.0) * 2 ** (tentativa - 1), 60)
+
             try:
-                resp = self.sessao.get(url, params=params, timeout=self.timeout,
+                resp = self.sessao.get(url, params=params, timeout=TIMEOUT,
                                        allow_redirects=False, verify=self.sessao.verify)
             except requests.exceptions.SSLError:
-                # Erro de certificado nao se resolve tentando de novo.
                 self.requisicoes += 1
                 raise
             except (requests.ConnectionError, requests.Timeout) as e:
-                espera = min(2 ** tentativa, 60)
-                log.warning("Falha de rede (%s). Nova tentativa em %ss", e, espera)
-                time.sleep(espera)
+                self.requisicoes += 1
+                problema = "tempo esgotado" if isinstance(e, requests.Timeout) else "falha de conexao"
+                log.warning("%s (tentativa %d/%d). Nova tentativa em %.0fs",
+                            problema, tentativa, MAX_TENTATIVAS, backoff)
+                log.debug("Detalhe: %s", e)
+                self._agendar(backoff)
                 continue
             self.requisicoes += 1
 
-            if resp.status_code == 429 or resp.status_code >= 500:
-                espera = _retry_after(resp)
-                if espera is None:
-                    espera = min(2 ** tentativa, 60)
-                log.warning("HTTP %s em %s. Nova tentativa em %ss",
-                            resp.status_code, resp.url, espera)
-                time.sleep(espera)
-                continue
-            if 300 <= resp.status_code < 400:
-                destino = resp.headers.get("Location")
-                if eh_login(destino):
-                    raise ErroAutenticacao("PAT recusado (redirecionado para a tela de login)")
-                raise NaoEhConfluence(
-                    f"Redirecionado para {destino!r} (provavel URL base errada)")
-            if resp.status_code == 401:
-                raise ErroAutenticacao(f"PAT recusado (HTTP 401 em {resp.url})")
-            if resp.status_code == 403:
-                raise SemPermissao(f"Sem permissao (HTTP 403 em {resp.url})")
-            resp.raise_for_status()
+            with resp:
+                if resp.status_code == 429:
+                    self.respostas_429 += 1
+                    espera = segundos_retry_after(resp)
+                    self._ajustar_ritmo(resp.headers, apos_429=True)
+                    log.debug("Cabecalhos do 429: %s", cabecalhos_limite(resp.headers))
+                    if espera is None:
+                        espera = backoff
+                    if espera > MAX_RETRY_AFTER:
+                        raise LimiteExcedido(
+                            f"o Confluence pediu {espera:.0f}s de espera (HTTP 429)")
+                    problema = "HTTP 429"
+                    log.warning("HTTP 429 (tentativa %d/%d). Aguardando %.0fs",
+                                tentativa, MAX_TENTATIVAS, max(espera, self.intervalo))
+                    self._agendar(espera)
+                    continue
 
-            if "json" not in resp.headers.get("Content-Type", "").lower():
-                raise NaoEhConfluence(
-                    f"Resposta nao e JSON ({resp.headers.get('Content-Type')}) em {resp.url}")
-            try:
-                return resp.json()
-            except ValueError as e:
-                raise NaoEhConfluence(f"JSON invalido em {resp.url}") from e
+                if resp.status_code == 408 or resp.status_code >= 500:
+                    espera = segundos_retry_after(resp) or backoff
+                    if espera > MAX_RETRY_AFTER:
+                        raise FalhaServidor(
+                            f"o Confluence pediu {espera:.0f}s de espera (HTTP {resp.status_code})")
+                    problema = f"HTTP {resp.status_code}"
+                    log.warning("%s em %s (tentativa %d/%d). Nova tentativa em %.0fs",
+                                problema, resp.url, tentativa, MAX_TENTATIVAS, espera)
+                    self._agendar(max(espera, backoff))
+                    continue
 
-        raise RuntimeError(f"Desisti apos {MAX_TENTATIVAS} tentativas: {url}")
+                self._agendar(self._ajustar_ritmo(resp.headers))
+
+                if 300 <= resp.status_code < 400:
+                    destino = resp.headers.get("Location")
+                    if eh_login(destino):
+                        raise ErroAutenticacao("PAT recusado (redirecionado para a tela de login)")
+                    raise NaoEhConfluence(f"Redirecionado para {destino!r} (provavel URL base errada)")
+                if resp.status_code == 401:
+                    raise ErroAutenticacao(f"PAT recusado (HTTP 401 em {resp.url})")
+                if resp.status_code == 403:
+                    raise SemPermissao(f"Sem permissao (HTTP 403 em {resp.url})")
+                resp.raise_for_status()
+
+                if "json" not in resp.headers.get("Content-Type", "").lower():
+                    raise NaoEhConfluence(
+                        f"Resposta nao e JSON ({resp.headers.get('Content-Type')}) em {resp.url}")
+                try:
+                    return resp.json()
+                except ValueError as e:
+                    raise NaoEhConfluence(f"JSON invalido em {resp.url}") from e
+
+        if problema == "HTTP 429":
+            raise LimiteExcedido(f"HTTP 429 persistente apos {MAX_TENTATIVAS} tentativas")
+        raise FalhaServidor(f"sem resposta valida apos {MAX_TENTATIVAS} tentativas ({problema}): {url}")
+
+    # ---- paginacao com protecao contra loop
 
     def paginar(self, caminho: str, params: dict):
         url = self.api + caminho
         params = dict(params)
-        visitadas = set()
-        while True:
+        chaves_vistas: set[str] = set()
+        ids_vistos: set[str] = set()
+        ultimo_start = None
+
+        for pagina in range(1, MAX_PAGINAS_POR_LISTAGEM + 2):
+            if pagina > MAX_PAGINAS_POR_LISTAGEM:
+                self.listagens_truncadas += 1
+                log.warning("Listagem %s passou de %d paginas de resultado; parando",
+                            caminho, MAX_PAGINAS_POR_LISTAGEM)
+                return
+
             chave = url + "?" + urlencode(sorted((params or {}).items()))
-            if chave in visitadas:
+            if chave in chaves_vistas:
+                self.listagens_truncadas += 1
                 log.warning("Paginacao repetida detectada, parando em %s", chave)
                 return
-            visitadas.add(chave)
+            chaves_vistas.add(chave)
 
             dados = self._get(url, params)
             if not isinstance(dados, dict) or not isinstance(dados.get("results"), list):
                 raise NaoEhConfluence(f"Formato inesperado em {url}")
             resultados = dados["results"]
+
+            ids = {str(r.get("id")) for r in resultados if isinstance(r, dict)}
+            novos = ids - ids_vistos
+            ids_vistos |= ids
             yield from resultados
+
+            if resultados and not novos:
+                # O servidor devolveu de novo os mesmos itens: ignorou o "start" ou o "next" anda em circulo.
+                self.listagens_truncadas += 1
+                log.warning("Pagina de resultados sem itens novos em %s; parando", caminho)
+                return
 
             proximo = (dados.get("_links") or {}).get("next")
             if proximo:
                 url = proximo if proximo.startswith("http") else self.base + proximo
                 params = None
-            elif resultados and len(resultados) == dados.get("limit") and "start" in dados:
+            elif resultados and len(resultados) == dados.get("limit") and isinstance(dados.get("start"), int):
+                novo_start = dados["start"] + len(resultados)
+                if ultimo_start is not None and novo_start <= ultimo_start:
+                    self.listagens_truncadas += 1
+                    log.warning("Paginacao nao avancou em %s; parando", caminho)
+                    return
+                ultimo_start = novo_start
                 params = dict(params or {})
-                params["start"] = dados["start"] + len(resultados)
+                params["start"] = novo_start
             else:
                 return
 
@@ -212,14 +377,6 @@ class ConfluenceClient:
             "expand": "version,space",
             "limit": LIMITE_POR_REQUISICAO,
         })
-
-
-def _retry_after(resp: requests.Response) -> float | None:
-    valor = resp.headers.get("Retry-After")
-    try:
-        return min(float(valor), 300) if valor else None
-    except ValueError:
-        return None
 
 
 # --------------------------------------------------------------------------- metadados
@@ -337,8 +494,10 @@ class Resumo:
     rejeitadas: int = 0
     motivos_rejeicao: dict = field(default_factory=dict)
     ramos_erro: list = field(default_factory=list)
+    profundidade_excedida: int = 0
     interrompido: bool = False
-    limite_atingido: bool = False
+    limite_atingido: str = ""
+    abortado: tuple | None = None  # (codigo de saida, mensagem)
 
     def rejeitar(self, motivo: str):
         self.rejeitadas += 1
@@ -363,21 +522,49 @@ def validar_raiz(cliente: ConfluenceClient, raiz: Raiz) -> tuple[dict, str]:
     return dados, base
 
 
+class Disjuntor:
+    """Abre apos N falhas seguidas de rede/servidor; qualquer sucesso fecha de novo."""
+
+    def __init__(self, limite: int):
+        self.limite = limite
+        self.seguidas = 0
+
+    def sucesso(self):
+        self.seguidas = 0
+
+    def falha(self) -> bool:
+        self.seguidas += 1
+        return self.seguidas >= self.limite
+
+
 def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Raiz], *,
-             max_paginas: int | None = None, parar=lambda: False) -> Resumo:
-    """ErroAutenticacao e SSLError sobem para o chamador: nao adianta continuar sem PAT/TLS validos."""
+             max_paginas: int | None = None, max_profundidade: int = MAX_PROFUNDIDADE,
+             parar=lambda: False) -> Resumo:
     resumo = Resumo()
     visitadas: set[str] = set()
+    disjuntor = Disjuntor(FALHAS_SEGUIDAS)
+
+    def abrir_disjuntor():
+        resumo.abortado = (6, f"{disjuntor.seguidas} falhas seguidas sem resposta valida do Confluence. "
+                              "Confira a VPN, a URL e se o servidor esta no ar.")
 
     try:
         for raiz in raizes:
-            if parar() or resumo.limite_atingido:
+            if parar() or resumo.limite_atingido or resumo.abortado:
                 break
             try:
                 dados_raiz, base = validar_raiz(cliente, raiz)
+                disjuntor.sucesso()
             except (SemPermissao, requests.HTTPError) as e:
                 log.error("Raiz %s ignorada: %s", raiz.page_id, e)
                 resumo.raizes_erro.append((raiz.page_id, str(e)))
+                continue
+            except FalhaServidor as e:
+                log.error("Raiz %s ignorada: %s", raiz.page_id, e)
+                resumo.raizes_erro.append((raiz.page_id, str(e)))
+                if disjuntor.falha():
+                    abrir_disjuntor()
+                    break
                 continue
 
             titulo_raiz = dados_raiz.get("title", "")
@@ -386,19 +573,19 @@ def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Rai
             visitadas.add(raiz.page_id)
             antes = resumo.encontradas
 
-            fila = deque([raiz.page_id])
-            while fila:
+            fila = deque([(raiz.page_id, 0)])
+            while fila and not resumo.abortado:
                 if parar():
                     resumo.interrompido = True
                     break
-                pai = fila.popleft()
+                pai, nivel = fila.popleft()
                 try:
                     for item in cliente.filhas(pai):
                         if parar():
                             resumo.interrompido = True
                             break
                         if max_paginas and resumo.encontradas >= max_paginas:
-                            resumo.limite_atingido = True
+                            resumo.limite_atingido = f"limite de {max_paginas} paginas"
                             break
                         doc, motivo = extrair_metadados(item, base)
                         if doc is None:
@@ -408,27 +595,54 @@ def explorar(cliente: ConfluenceClient, repo: RepositorioMongo, raizes: list[Rai
                         if doc["page_id"] in visitadas:
                             continue
                         visitadas.add(doc["page_id"])
-                        fila.append(doc["page_id"])
 
-                        doc.update(pai_id=pai, raiz_id=raiz.page_id, raiz_titulo=titulo_raiz)
+                        if nivel + 1 < max_profundidade:
+                            fila.append((doc["page_id"], nivel + 1))
+                        else:
+                            resumo.profundidade_excedida += 1
+                            log.warning("Pagina %s no nivel %d: filhas nao serao exploradas",
+                                        doc["page_id"], nivel + 1)
+
+                        doc.update(pai_id=pai, raiz_id=raiz.page_id, raiz_titulo=titulo_raiz,
+                                   profundidade=nivel + 1)
                         repo.adicionar(doc)
                         resumo.encontradas += 1
                         if resumo.encontradas % 200 == 0:
-                            log.info("... %d paginas coletadas", resumo.encontradas)
-                except (SemPermissao, requests.HTTPError, RuntimeError) as e:
+                            log.info("... %d paginas coletadas (%d requisicoes)",
+                                     resumo.encontradas, cliente.requisicoes)
+                    disjuntor.sucesso()
+                except (SemPermissao, requests.HTTPError) as e:
                     log.error("Filhas de %s ignoradas: %s", pai, e)
                     resumo.ramos_erro.append(pai)
+                except FalhaServidor as e:
+                    log.error("Filhas de %s ignoradas: %s", pai, e)
+                    resumo.ramos_erro.append(pai)
+                    if disjuntor.falha():
+                        abrir_disjuntor()
                 if resumo.limite_atingido:
-                    log.info("Limite de %d paginas atingido", max_paginas)
                     break
 
             repo.descarregar()
             resumo.raizes.append((raiz.page_id, titulo_raiz, resumo.encontradas - antes))
             if resumo.interrompido:
                 break
+
+    except Interrompido:
+        resumo.interrompido = True
+    except OrcamentoEsgotado as e:
+        resumo.limite_atingido = str(e)
+    except LimiteExcedido as e:
+        resumo.abortado = (5, f"Limite de requisicoes do Confluence: {e}. Espere alguns minutos, "
+                              "confira se outro processo usa o mesmo PAT e rode de novo com --pausa maior.")
+    except ErroAutenticacao as e:
+        resumo.abortado = (4, f"{e}. Gere um novo PAT, atualize o {ARQUIVO_ENV} e rode de novo.")
+    except requests.exceptions.SSLError as e:
+        log.debug("Erro TLS: %s", e)
+        resumo.abortado = (4, "Certificado TLS recusado: " + explicar_erro_tls(e))
+    except NaoEhConfluence as e:
+        resumo.abortado = (3, f"A origem nao parece ser o Confluence: {e}")
     finally:
-        # Mesmo abortando por PAT/TLS, grava o que ja foi coletado.
-        repo.descarregar()
+        repo.descarregar()  # grava o que ja foi coletado, mesmo abortando
     return resumo
 
 
@@ -436,10 +650,12 @@ def imprimir_resumo(resumo: Resumo, cliente: ConfluenceClient, repo: Repositorio
     duracao = int(time.monotonic() - resumo.inicio)
     linha = "=" * 60
     status = ""
-    if resumo.interrompido:
+    if resumo.abortado:
+        status = "  (ABORTADO)"
+    elif resumo.interrompido:
         status = "  (interrompido)"
     elif resumo.limite_atingido:
-        status = "  (limite de paginas atingido)"
+        status = f"  ({resumo.limite_atingido})"
     print()
     print(linha)
     print(" RESUMO DO EXPLORER" + status)
@@ -463,8 +679,15 @@ def imprimir_resumo(resumo: Resumo, cliente: ConfluenceClient, repo: Repositorio
         print(f" Ramos com erro ......... {len(resumo.ramos_erro)}: "
               + ", ".join(resumo.ramos_erro[:10])
               + (" ..." if len(resumo.ramos_erro) > 10 else ""))
-    print(f" Requisicoes HTTP ....... {cliente.requisicoes}")
+    if resumo.profundidade_excedida:
+        print(f" Paginas no limite de profundidade ... {resumo.profundidade_excedida}")
+    if cliente.listagens_truncadas:
+        print(f" Listagens interrompidas (anti-loop) . {cliente.listagens_truncadas}")
+    print(f" Requisicoes HTTP ....... {cliente.requisicoes} ({cliente.respostas_429} com HTTP 429)")
+    print(f" Ritmo final ............ 1 requisicao a cada {cliente.intervalo:.1f}s")
     print(f" Tempo total ............ {duracao // 60}m{duracao % 60:02d}s")
+    if resumo.abortado:
+        print(f" Motivo ................. {resumo.abortado[1]}")
     print(linha)
 
 
@@ -474,15 +697,20 @@ def main(argv=None) -> int:
     p.add_argument("raizes", nargs="*", default=RAIZES_PADRAO,
                    help="caminho (/spaces/X/pages/ID/...), URL ou ID das paginas-raiz "
                         "(padrao: CCENTER 2026 e 2025)")
-    p.add_argument("--max-paginas", type=int, help="para apos N paginas")
-    p.add_argument("--pausa", type=float, default=0.0,
-                   help="segundos de espera entre requisicoes (padrao 0)")
+    p.add_argument("--max-paginas", type=int, help="para apos N paginas coletadas")
+    p.add_argument("--max-requisicoes", type=int, help="para apos N requisicoes HTTP")
+    p.add_argument("--max-profundidade", type=int, default=MAX_PROFUNDIDADE,
+                   help=f"niveis abaixo da raiz a explorar (padrao {MAX_PROFUNDIDADE})")
+    p.add_argument("--pausa", type=float, default=INTERVALO_MINIMO,
+                   help=f"segundos minimos entre requisicoes (padrao {INTERVALO_MINIMO}); "
+                        "sobe sozinho se o Confluence pedir")
     p.add_argument("--dry-run", action="store_true", help="nao grava no Mongo")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     try:
         raizes = [parse_raiz(r) for r in args.raizes]
@@ -491,7 +719,18 @@ def main(argv=None) -> int:
         return 2
 
     base_url, pat, ca_bundle, env = ler_env()
-    cliente = ConfluenceClient(base_url, pat, ca_bundle, pausa=args.pausa)
+
+    interromper = {"sim": False}
+
+    def ao_ctrl_c(*_):
+        if interromper["sim"]:
+            raise KeyboardInterrupt
+        interromper["sim"] = True
+        log.warning("Interrompendo (Ctrl+C de novo para forcar)...")
+
+    cliente = ConfluenceClient(base_url, pat, ca_bundle, intervalo=args.pausa,
+                               max_requisicoes=args.max_requisicoes,
+                               parar=lambda: interromper["sim"])
 
     colecao = None
     if not args.dry_run:
@@ -502,36 +741,24 @@ def main(argv=None) -> int:
         except PyMongoError as e:
             log.error("Nao foi possivel conectar ao MongoDB: %s", e)
             return 2
-        nome_db = env.get("MONGO_DB") or MONGO_DB_PADRAO
-        nome_colecao = env.get("MONGO_COLLECTION") or MONGO_COLLECTION_PADRAO
-        colecao = mongo[nome_db][nome_colecao]
+        colecao = mongo[env.get("MONGO_DB") or MONGO_DB_PADRAO][
+            env.get("MONGO_COLLECTION") or MONGO_COLLECTION_PADRAO]
     repo = RepositorioMongo(colecao, dry_run=args.dry_run)
-
-    interromper = {"sim": False}
-
-    def ao_ctrl_c(*_):
-        if interromper["sim"]:
-            raise KeyboardInterrupt
-        interromper["sim"] = True
-        log.warning("Interrompendo apos o item atual (Ctrl+C de novo para forcar)...")
 
     signal.signal(signal.SIGINT, ao_ctrl_c)
 
     try:
         resumo = explorar(cliente, repo, raizes, max_paginas=args.max_paginas,
+                          max_profundidade=args.max_profundidade,
                           parar=lambda: interromper["sim"])
-    except requests.exceptions.SSLError as e:
-        log.debug("Erro TLS: %s", e)
-        log.error("Certificado TLS recusado: %s", explicar_erro_tls(e))
-        return 4
-    except ErroAutenticacao as e:
-        log.error("%s. Gere um novo PAT, atualize o %s e rode de novo.", e, ARQUIVO_ENV)
-        return 4
-    except NaoEhConfluence as e:
-        log.error("Abortado - a origem nao parece ser o Confluence: %s", e)
-        return 3
+    except KeyboardInterrupt:
+        log.error("Interrompido a forca.")
+        return 130
 
     imprimir_resumo(resumo, cliente, repo)
+    if resumo.abortado:
+        log.error(resumo.abortado[1])
+        return resumo.abortado[0]
     return 1 if (resumo.raizes_erro or resumo.ramos_erro) else 0
 
 
