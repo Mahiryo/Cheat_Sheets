@@ -25,6 +25,31 @@ try:
 except ImportError:
     sys.exit("Esqueceu das dependências. Instale com: python -m pip install -r requirements.txt")
 
+"""
+CONFLUENCE_BASE_URL=https://confluence.suaempresa.com.br
+CONFLUENCE_PAT=
+CONFLUENCE_CA_BUNDLE=
+
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=local
+MONGO_COLLECTION=paginas
+
+EXPLORER_RAIZES=
+EXPLORER_ARQUIVO_RAIZES=raizes.txt
+
+EXPLORER_DIAGNOSTICO=TRUE
+EXPLORER_DRY_RUN=TRUE
+EXPLORER_SO_ARVORE=FALSE
+EXPLORER_VERBOSE=FALSE
+
+EXPLORER_MAX_PAGINAS=200
+EXPLORER_MAX_REQUISICOES=150
+EXPLORER_MAX_PROFUNDIDADE=5
+EXPLORER_PAUSA=5
+EXPLORER_PAUSA_ENTRE_RAIZES=30
+"""
+
+
 log = logging.getLogger("explorer")
 
 ARQUIVO_ENV = ".env"
